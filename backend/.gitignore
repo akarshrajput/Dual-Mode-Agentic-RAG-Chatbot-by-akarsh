@@ -1,0 +1,7 @@
+.env
+*.zip
+*.db
+logs/
+logs-prod/
+chroma_db/
+__pycache__/

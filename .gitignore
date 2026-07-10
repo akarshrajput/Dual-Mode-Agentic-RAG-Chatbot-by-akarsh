@@ -1,0 +1,9 @@
+backend/.env
+backend/*.zip
+backend/*.db
+backend/logs/
+backend/logs-prod/
+backend/chroma_db/
+backend/__pycache__/
+frontend/.next/
+frontend/node_modules/
