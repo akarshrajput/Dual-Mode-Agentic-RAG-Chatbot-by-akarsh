@@ -7,8 +7,15 @@ from pypdf import PdfReader
 from groq import Groq
 
 CURRENT_DIR = Path(__file__).resolve().parent
-DATA_DIR = CURRENT_DIR.parent / "data"
+DATA_DIR_CANDIDATES = [CURRENT_DIR / "data", CURRENT_DIR.parent / "data"]
 DB_PATH = CURRENT_DIR / "orders.db"
+
+def _resolve_data_path(filename: str) -> Path:
+    for data_dir in DATA_DIR_CANDIDATES:
+        candidate = data_dir / filename
+        if candidate.exists():
+            return candidate
+    return DATA_DIR_CANDIDATES[-1] / filename
 
 def _tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
@@ -35,10 +42,16 @@ def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> list[str]
 @lru_cache(maxsize=1)
 def _load_document_chunks() -> list[dict]:
     chunks: list[dict] = []
-    if not DATA_DIR.exists():
+    pdf_dirs = [data_dir for data_dir in DATA_DIR_CANDIDATES if data_dir.exists()]
+    if not pdf_dirs:
         return chunks
 
-    for pdf_path in sorted(DATA_DIR.glob("*.pdf")):
+    seen_files: set[Path] = set()
+    for data_dir in pdf_dirs:
+        for pdf_path in sorted(data_dir.glob("*.pdf")):
+            if pdf_path in seen_files:
+                continue
+            seen_files.add(pdf_path)
         try:
             reader = PdfReader(str(pdf_path))
         except Exception:
@@ -200,7 +213,11 @@ SQL:"""
         if not DB_PATH.exists():
             from ingest import ingest_orders
 
-            ingest_orders(str(DATA_DIR / "orders.csv"), str(DB_PATH))
+            csv_path = _resolve_data_path("orders.csv")
+            if not csv_path.exists():
+                return {"sql": "", "rows": [], "error": "orders.csv is not available"}
+
+            ingest_orders(str(csv_path), str(DB_PATH))
 
         db_uri = f"file:{DB_PATH}?mode=ro"
         conn = sqlite3.connect(db_uri, uri=True)
