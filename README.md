@@ -2,6 +2,15 @@
 
 An assessment chatbot that answers questions using vector RAG over company documents and text-to-SQL over an orders database.
 
+## Live Links
+
+| Deliverable | URL |
+|---|---|
+| Live Chatbot | https://dual-mode-agentic-rag-chatbot-by-ak.vercel.app |
+| GitHub Repository | https://github.com/akarshrajput/Dual-Mode-Agentic-RAG-Chatbot-by-akarsh |
+
+> **Note:** The backend is hosted on Render's free tier. On first visit, the server may take ~60 seconds to cold-start. The frontend shows a progress indicator during this wait.
+
 ## Architecture
 
 - **Backend**: FastAPI, Python 3.11.
