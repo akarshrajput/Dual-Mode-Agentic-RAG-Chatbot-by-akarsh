@@ -25,6 +25,9 @@ export default function ChatPage() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [openSection, setOpenSection] = useState<{ [key: string]: "none" | "citations" | "sql" }>({});
+  const [backendReady, setBackendReady] = useState(false);
+  const [backendChecking, setBackendChecking] = useState(true);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   
@@ -35,6 +38,47 @@ export default function ChatPage() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  // Backend health check with cold-start handling
+  useEffect(() => {
+    const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+    let cancelled = false;
+    let timerInterval: NodeJS.Timeout;
+
+    // Start elapsed timer
+    const startTime = Date.now();
+    timerInterval = setInterval(() => {
+      if (!cancelled) {
+        setElapsedSeconds(Math.floor((Date.now() - startTime) / 1000));
+      }
+    }, 1000);
+
+    const checkHealth = async () => {
+      while (!cancelled) {
+        try {
+          const res = await fetch(`${apiUrl}/health`, { signal: AbortSignal.timeout(5000) });
+          if (res.ok) {
+            if (!cancelled) {
+              setBackendReady(true);
+              setBackendChecking(false);
+            }
+            break;
+          }
+        } catch {
+          // Backend not ready yet, retry
+        }
+        // Wait 3 seconds before retrying
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    };
+
+    checkHealth();
+
+    return () => {
+      cancelled = true;
+      clearInterval(timerInterval);
+    };
+  }, []);
 
   const toggleSection = (messageId: string, section: "citations" | "sql") => {
     setOpenSection((prev) => {
@@ -48,7 +92,7 @@ export default function ChatPage() {
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || loading) return;
+    if (!input.trim() || loading || !backendReady) return;
 
     const userMessageText = input.trim();
     setInput("");
@@ -204,16 +248,97 @@ export default function ChatPage() {
             background: "rgba(30, 41, 59, 0.4)",
             padding: "6px 12px",
             borderRadius: "20px",
-            border: "1px solid var(--border-color)",
+            border: `1px solid ${backendReady ? 'rgba(16, 185, 129, 0.3)' : 'rgba(251, 191, 36, 0.3)'}`,
             fontSize: "13px",
-            color: "#10b981",
+            color: backendReady ? "#10b981" : "#fbbf24",
             fontWeight: 500,
+            transition: "all 0.5s ease",
           }}
         >
-          <span className="pulse-dot"></span>
-          System Online
+          <span
+            style={{
+              width: "8px",
+              height: "8px",
+              borderRadius: "50%",
+              background: backendReady ? "#10b981" : "#fbbf24",
+              animation: backendReady ? "pulse 2s infinite" : "pulse 1s infinite",
+            }}
+          />
+          {backendReady ? "System Online" : "Waking Up..."}
         </div>
       </header>
+
+      {/* Cold-start banner */}
+      {backendChecking && !backendReady && (
+        <div
+          style={{
+            background: "linear-gradient(135deg, rgba(251, 191, 36, 0.08) 0%, rgba(245, 158, 11, 0.08) 100%)",
+            border: "1px solid rgba(251, 191, 36, 0.25)",
+            borderRadius: "12px",
+            padding: "16px 20px",
+            marginBottom: "20px",
+            animation: "fadeIn 0.5s ease",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "10px" }}>
+            <span style={{ fontSize: "20px" }}>☕</span>
+            <div>
+              <div style={{ color: "#fbbf24", fontWeight: 600, fontSize: "14px" }}>
+                Backend is waking up on Render (free tier cold start)
+              </div>
+              <div style={{ color: "rgba(251, 191, 36, 0.7)", fontSize: "13px", marginTop: "2px" }}>
+                This typically takes about 50–60 seconds. Please wait...
+              </div>
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+            <div
+              style={{
+                flex: 1,
+                height: "4px",
+                background: "rgba(251, 191, 36, 0.15)",
+                borderRadius: "4px",
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  height: "100%",
+                  width: `${Math.min((elapsedSeconds / 60) * 100, 95)}%`,
+                  background: "linear-gradient(90deg, #fbbf24, #f59e0b)",
+                  borderRadius: "4px",
+                  transition: "width 1s linear",
+                }}
+              />
+            </div>
+            <span style={{ color: "rgba(251, 191, 36, 0.8)", fontSize: "12px", fontWeight: 600, minWidth: "30px" }}>
+              {elapsedSeconds}s
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Backend ready success banner (briefly shown) */}
+      {backendReady && elapsedSeconds > 3 && elapsedSeconds < 8 && (
+        <div
+          style={{
+            background: "linear-gradient(135deg, rgba(16, 185, 129, 0.08) 0%, rgba(52, 211, 153, 0.08) 100%)",
+            border: "1px solid rgba(16, 185, 129, 0.25)",
+            borderRadius: "12px",
+            padding: "12px 20px",
+            marginBottom: "20px",
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+            animation: "fadeIn 0.5s ease",
+          }}
+        >
+          <span style={{ fontSize: "18px" }}>✅</span>
+          <span style={{ color: "#34d399", fontWeight: 600, fontSize: "14px" }}>
+            Backend is live! You can start chatting now.
+          </span>
+        </div>
+      )}
 
       <section
         style={{
@@ -500,7 +625,7 @@ export default function ChatPage() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder="Ask EMB Global agent..."
-          disabled={loading}
+          disabled={loading || !backendReady}
           style={{
             flex: 1,
             background: "none",
@@ -509,24 +634,25 @@ export default function ChatPage() {
             padding: "12px 16px",
             fontSize: "15px",
             color: "#fff",
+            opacity: backendReady ? 1 : 0.5,
           }}
         />
         <button
           type="submit"
-          disabled={loading || !input.trim()}
+          disabled={loading || !input.trim() || !backendReady}
           style={{
-            background: loading || !input.trim() ? "rgba(255,255,255,0.05)" : "var(--accent-gradient)",
-            color: loading || !input.trim() ? "rgba(255,255,255,0.3)" : "#fff",
+            background: loading || !input.trim() || !backendReady ? "rgba(255,255,255,0.05)" : "var(--accent-gradient)",
+            color: loading || !input.trim() || !backendReady ? "rgba(255,255,255,0.3)" : "#fff",
             padding: "0 24px",
             border: "none",
             borderRadius: "var(--radius-sm)",
             fontSize: "14px",
             fontWeight: 600,
-            cursor: loading || !input.trim() ? "not-allowed" : "pointer",
+            cursor: loading || !input.trim() || !backendReady ? "not-allowed" : "pointer",
             transition: "opacity 0.2s",
           }}
         >
-          {loading ? "Thinking..." : "Send Query"}
+          {!backendReady ? "Waiting..." : loading ? "Thinking..." : "Send Query"}
         </button>
       </form>
     </div>
