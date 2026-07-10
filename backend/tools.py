@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import sqlite3
 from functools import lru_cache
 from pathlib import Path
@@ -52,45 +53,90 @@ def _load_document_chunks() -> list[dict]:
             if pdf_path in seen_files:
                 continue
             seen_files.add(pdf_path)
-        try:
-            reader = PdfReader(str(pdf_path))
-        except Exception:
-            continue
 
-        text_parts = []
-        for page in reader.pages:
-            extracted = page.extract_text() or ""
-            if extracted:
-                text_parts.append(extracted)
+            try:
+                reader = PdfReader(str(pdf_path))
+            except Exception:
+                continue
 
-        for chunk_index, chunk in enumerate(chunk_text("\n".join(text_parts))):
-            tokens = set(_tokenize(chunk))
-            if tokens:
-                chunks.append({
-                    "text": chunk,
-                    "source": pdf_path.name,
-                    "chunk_index": chunk_index,
-                    "tokens": tokens,
-                })
+            text_parts = []
+            for page in reader.pages:
+                extracted = page.extract_text() or ""
+                if extracted:
+                    text_parts.append(extracted)
+
+            full_text = "\n".join(text_parts)
+            if not full_text.strip():
+                continue
+
+            for chunk_index, chunk in enumerate(chunk_text(full_text)):
+                tokens = set(_tokenize(chunk))
+                if tokens:
+                    chunks.append({
+                        "text": chunk,
+                        "source": pdf_path.name,
+                        "chunk_index": chunk_index,
+                        "tokens": tokens,
+                    })
 
     return chunks
+
+def _extract_search_keywords(query: str) -> list[str]:
+    """Use Groq LLM to extract better search keywords from the user query."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return []
+
+    client = Groq(api_key=api_key)
+    prompt = f"""Extract the most important search keywords from this question. 
+Include synonyms and related terms that might appear in company policy documents.
+Return ONLY a JSON array of lowercase keyword strings, nothing else.
+
+Question: "{query}"
+
+Examples:
+- "How many days of paid annual leave?" → ["annual", "leave", "paid", "days", "vacation", "holiday", "pto", "full-time", "entitlement"]
+- "What is the return policy?" → ["return", "returns", "refund", "policy", "exchange", "days", "window"]
+- "What does the warranty cover?" → ["warranty", "coverage", "covered", "defect", "repair", "replacement", "claim"]
+"""
+    try:
+        resp = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You output only valid JSON arrays of strings."},
+                {"role": "user", "content": prompt}
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.0,
+        )
+        raw = resp.choices[0].message.content.strip()
+        keywords = json.loads(raw)
+        if isinstance(keywords, list):
+            return [str(k).lower() for k in keywords]
+    except Exception:
+        pass
+    return []
+
 
 def search_documents(query: str) -> list:
     query_tokens = set(_tokenize(query))
     if not query_tokens:
         return []
 
+    # Augment query tokens with LLM-extracted keywords for better recall
+    extra_keywords = _extract_search_keywords(query)
+    expanded_tokens = query_tokens | set(extra_keywords)
+
     scored_chunks = []
     for chunk in _load_document_chunks():
-        overlap = len(query_tokens & chunk["tokens"])
+        overlap = len(expanded_tokens & chunk["tokens"])
         if not overlap:
             continue
 
-        coverage = overlap / max(1, len(query_tokens))
+        coverage = overlap / max(1, len(expanded_tokens))
         density = overlap / max(1, len(chunk["tokens"]))
-        score = min(1.0, (coverage * 0.8) + (density * 0.2))
+        score = min(1.0, (coverage * 0.7) + (density * 0.3))
 
-        if score >= 0.05:
+        if score >= 0.01:
             scored_chunks.append({
                 "text": chunk["text"],
                 "source": chunk["source"],
@@ -99,7 +145,7 @@ def search_documents(query: str) -> list:
             })
 
     scored_chunks.sort(key=lambda item: item["score"], reverse=True)
-    return scored_chunks[:4]
+    return scored_chunks[:6]
 
 VALID_IDENTIFIERS = {
     "orders", "order_id", "customer", "product", "amount", "status", "order_date",

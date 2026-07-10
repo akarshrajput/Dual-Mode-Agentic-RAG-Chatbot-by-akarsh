@@ -1,4 +1,5 @@
 backend/.env
+backend/.venv/
 backend/*.zip
 backend/*.db
 backend/logs/

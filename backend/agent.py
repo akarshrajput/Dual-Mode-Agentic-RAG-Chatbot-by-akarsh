@@ -1,6 +1,7 @@
 import os
 import json
 import re
+from typing import Optional, Tuple
 from groq import Groq
 
 try:
@@ -10,9 +11,16 @@ except ImportError:
 
 SYSTEM_PROMPT = """You are a helpful assistant for EMB Global.
 Today's date is 15 June 2026. Relative date calculations should be based on this date.
-If you cannot answer the question using the retrieved information from the tools, or if the question is out of scope, answer: "I don't have that information."
 
-When you decide to call a tool, you must follow the native tool call syntax. Make sure to always include the closing angle bracket '>' right after the tool name and before the JSON arguments, for example: <function=search_documents>{"query": "..."}</function> or <function=query_orders>{"question": "..."}</function>.
+You have access to two tools:
+1. search_documents — searches company policy PDFs (HR leave policy, returns policy, warranty policy, pricing & discounts policy, product FAQ). Use this for ANY question about company policies, employee benefits, product info, warranties, returns, pricing, or FAQs.
+2. query_orders — queries the orders database. Use this for questions about sales, revenue, order counts, customer orders, or order status.
+
+IMPORTANT INSTRUCTIONS:
+- ALWAYS call a tool before answering. Do NOT answer from your own knowledge.
+- When you receive document search results, carefully READ the retrieved text chunks and extract the answer from them. The answer IS in the retrieved text — look carefully.
+- Only say "I don't have that information." if the retrieved documents truly do not contain any relevant information to answer the question.
+- Provide clear, specific answers with details from the source documents.
 """
 
 TOOLS_SCHEMA = [
@@ -52,6 +60,61 @@ TOOLS_SCHEMA = [
     }
 ]
 
+
+def _parse_failed_tool_call(error_body: dict) -> Tuple[Optional[str], Optional[dict]]:
+    """Parse a function name and args from Groq's failed_generation field.
+
+    When Llama generates a malformed text-based tool call like:
+        <function=search_documents>{"query": "..."}</function>
+    or  <function=search_documents{"query": "..."}</function>
+    Groq returns a 400 with 'tool_use_failed' and the raw text in 'failed_generation'.
+    This helper extracts the function name and JSON arguments so we can execute manually.
+    """
+    failed = error_body.get("error", {}).get("failed_generation", "")
+    if not failed:
+        return None, None
+
+    # Pattern: <function=FUNC_NAME>JSON</function>  or  <function=FUNC_NAMEJSON</function>
+    match = re.search(
+        r'<function=(\w+)>?\s*(\{.*?\})\s*</function>',
+        failed,
+        re.DOTALL,
+    )
+    if not match:
+        return None, None
+
+    func_name = match.group(1)
+    try:
+        args = json.loads(match.group(2))
+    except json.JSONDecodeError:
+        return None, None
+
+    return func_name, args
+
+
+def _execute_tool(func_name: str, args: dict):
+    """Execute a tool by name and return (result_content, tool_used, citations, sql_query, sql_rows)."""
+    citations = []
+    sql_query = None
+    sql_rows = None
+
+    if func_name == "search_documents":
+        query = args.get("query", "")
+        results = search_documents(query)
+        citations.extend(results)
+        content = json.dumps(results) if results else "No documents found."
+    elif func_name == "query_orders":
+        q = args.get("question", "")
+        res = query_orders(q)
+        sql_query = res.get("sql")
+        sql_rows = res.get("rows")
+        content = json.dumps(res)
+    else:
+        content = json.dumps({"error": f"Unknown tool: {func_name}"})
+
+    return content, citations, sql_query, sql_rows
+
+
 def run_agent_loop(user_message: str):
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
@@ -65,6 +128,13 @@ def run_agent_loop(user_message: str):
         {"role": "user", "content": user_message}
     ]
     
+    tool_used = []
+    citations = []
+    sql_query = None
+    sql_rows = None
+    tool_calls = None
+    fallback_tool = None  # Set when we recover from a failed tool call
+
     # 1. Non-streaming call to check for tool choices
     try:
         response = client.chat.completions.create(
@@ -74,77 +144,79 @@ def run_agent_loop(user_message: str):
             tool_choice="auto",
             temperature=0.0
         )
+        choice_msg = response.choices[0].message
+        tool_calls = choice_msg.tool_calls
     except Exception as e:
-        yield json.dumps({"error": f"Groq API Error: {str(e)}"}) + "\n"
-        return
-        
-    choice_msg = response.choices[0].message
-    tool_calls = choice_msg.tool_calls
-    
-    tool_used = []
-    citations = []
-    sql_query = None
-    sql_rows = None
-    
-    if tool_calls:
-        messages.append(choice_msg)
-        
-        for call in tool_calls:
-            func_name = call.function.name
-            args = json.loads(call.function.arguments)
-            tool_used.append(func_name)
-            
-            if func_name == "search_documents":
-                query = args.get("query", "")
-                results = search_documents(query)
-                citations.extend(results)
-                
-                # If no valid document found, yield early fallback or pass empty content
-                content = json.dumps(results) if results else "No documents found."
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "name": func_name,
-                    "content": content
-                })
-                
-            elif func_name == "query_orders":
-                q = args.get("question", "")
-                res = query_orders(q)
-                sql_query = res.get("sql")
-                sql_rows = res.get("rows")
-                err = res.get("error")
-                
-                content = json.dumps(res)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "name": func_name,
-                    "content": content
-                })
-        
-        # Determine if we should trigger fallback before calling LLM again
-        # If search was run but returned nothing AND sql was run but failed or returned nothing
-        # (or if either run resulted in empty outcomes and no other tool succeeded)
-        # Let's let the LLM synthesize, but guide it with system instructions.
-        # Wait, if both tools returned empty/error, we can just yield fallback directly.
-        # Let's check:
-        has_docs = not ("search_documents" in tool_used and not citations)
-        has_sql = not ("query_orders" in tool_used and (sql_rows is None or not sql_rows))
-        
-        if not has_docs or not has_sql:
-            # Trigger immediate fallback to guarantee correctness and save latency/costs
-            for chunk in ["I", " do", "n't", " have", " that", " information", "."]:
-                yield json.dumps({"token": chunk}) + "\n"
-            yield json.dumps({
-                "metadata": {
-                    "tool_used": tool_used,
-                    "citations": citations,
-                    "sql": sql_query,
-                    "sql_rows": sql_rows
-                }
-            }) + "\n"
+        error_str = str(e)
+        # Check if this is a tool_use_failed error from Groq
+        if "tool_use_failed" in error_str or "Failed to call a function" in error_str:
+            # Parse the function call directly from the error string
+            # (Groq uses Python repr format with single quotes, not valid JSON,
+            #  so we extract the <function=...> pattern directly)
+            func_match = re.search(
+                r'<function=(\w+)>?\s*(\{.*?\})\s*</function>',
+                error_str,
+                re.DOTALL,
+            )
+            if func_match:
+                func_name = func_match.group(1)
+                try:
+                    args = json.loads(func_match.group(2))
+                    fallback_tool = (func_name, args)
+                except json.JSONDecodeError:
+                    pass
+
+            if not fallback_tool:
+                yield json.dumps({"error": f"Groq API Error: {error_str}"}) + "\n"
+                return
+        else:
+            yield json.dumps({"error": f"Groq API Error: {error_str}"}) + "\n"
             return
+
+    # Handle tool calls — either from the API response or recovered from failed_generation
+    if tool_calls or fallback_tool:
+        if tool_calls:
+            messages.append(choice_msg)
+
+            for call in tool_calls:
+                func_name = call.function.name
+                args = json.loads(call.function.arguments)
+                tool_used.append(func_name)
+
+                content, cit, sq, sr = _execute_tool(func_name, args)
+                citations.extend(cit)
+                if sq is not None:
+                    sql_query = sq
+                if sr is not None:
+                    sql_rows = sr
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "name": func_name,
+                    "content": content
+                })
+        else:
+            # Recovered from failed_generation — execute manually
+            func_name, args = fallback_tool
+            tool_used.append(func_name)
+
+            content, cit, sq, sr = _execute_tool(func_name, args)
+            citations.extend(cit)
+            if sq is not None:
+                sql_query = sq
+            if sr is not None:
+                sql_rows = sr
+
+            # Build messages as if the tool was called normally (use assistant + user context)
+            messages.append({
+                "role": "assistant",
+                "content": f"I searched using {func_name} for the user's question."
+            })
+            messages.append({
+                "role": "user",
+                "content": f"Here are the results from {func_name}:\n{content}\n\nBased on these results, please answer the original question: {user_message}"
+            })
 
         # 2. Final call (streaming) with tool outputs
         try:
@@ -163,13 +235,8 @@ def run_agent_loop(user_message: str):
             return
             
     else:
-        # No tool calls, output text directly (stream it locally)
+        # No tool calls — the LLM may have answered directly or provided a fallback
         content = choice_msg.content or "I don't have that information."
-        # If the LLM didn't call tools, make sure it didn't invent info.
-        # Standardize fallback if it didn't call tools but didn't output the fallback string
-        # e.g., if it gave general knowledge, override it with fallback if it doesn't match fallback
-        if "I don't have that information" not in content:
-            content = "I don't have that information."
             
         words = re.findall(r'\s+|\S+', content)
         for w in words:
